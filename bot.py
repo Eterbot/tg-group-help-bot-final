@@ -8,10 +8,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # --- CONFIGURATION ---
 TOKEN = "7529003560:AAGIIp-RM4tPwbH8dxD5fc2cdz22pvuu-Cw"
-BOT_NAME = "GP Help Bot"
-OWNER_ID = None  # Will be set dynamically or can be hardcoded
-AWAY_MODE = False
-CUSTOM_FACTS = {} # Simple in-memory memory for facts
+# Default configuration
+BOT_CONFIG = {
+    "name": "GP Help Bot",
+    "owner_id": None,
+    "away_mode": False
+}
+CUSTOM_FACTS = {} 
 SETTINGS = {
     "antichannelpin": "off",
     "cleanlinked": "off"
@@ -28,9 +31,6 @@ app = Flask('')
 def home():
     return "Bot is running 24/7!"
 
-def run_web():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
-
 # --- HELPERS ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == constants.ChatType.PRIVATE:
@@ -41,21 +41,24 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- BOT HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Hello! I am {BOT_NAME}, your group management bot. Use /help to see what I can do.")
+    await update.message.reply_text(f"Hello! I am {BOT_CONFIG['name']}, your group management bot. Use /help to see what I can do.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "<b>Available Commands:</b>\n"
+        f"<b>Current Bot Name:</b> {BOT_CONFIG['name']}\n\n"
+        "<b>General Commands:</b>\n"
         "/start - Start the bot\n"
         "/help - Show this message\n"
+        "/setname [name] - Change my name (Admin only)\n"
+        "/away - Toggle Owner Away Mode\n"
+        "/teach [fact] [value] - Teach me something\n"
+        "/id - Get IDs\n\n"
+        "<b>Admin/Mod Commands:</b>\n"
         "/ban - Ban a user (Reply)\n"
         "/kick - Kick a user (Reply)\n"
         "/mute - Mute a user (Reply)\n"
         "/unban - Unban a user\n"
-        "/unmute - Unmute a user\n"
-        "/away - Toggle Owner Away Mode\n"
-        "/teach [fact] [value] - Teach me something\n"
-        "/id - Get IDs\n\n"
+        "/unmute - Unmute a user\n\n"
         "<b>Pin Commands:</b>\n"
         "/pinned - Get current pin\n"
         "/pin - Pin a message (Reply)\n"
@@ -63,16 +66,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/unpin - Unpin message\n"
         "/unpinall - Unpin all\n"
         "/antichannelpin [on/off] - Toggle channel pin blocking\n"
-        "/cleanlinked [on/off] - Delete linked channel messages\n"
+        "/cleanlinked [on/off] - Delete linked channel messages\n\n"
+        f"<i>Tip: Mention '{BOT_CONFIG['name']}' in your message to talk to me!</i>"
     )
     await update.message.reply_text(help_text, parse_mode=constants.ParseMode.HTML)
 
+async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text("Usage: /setname [new_name]")
+        return
+    new_name = " ".join(context.args)
+    BOT_CONFIG["name"] = new_name
+    await update.message.reply_text(f"My name has been changed to: {new_name}\nFrom now on, call me '{new_name}' to get my attention!")
+
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AWAY_MODE, OWNER_ID
     if not update.message:
         return
 
-    # Handle linked channel messages if cleanlinked is on
+    # Handle linked channel messages
     if update.message.is_automatic_forward and SETTINGS["cleanlinked"] == "on":
         try:
             await update.message.delete()
@@ -80,7 +92,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # Handle channel pins if antichannelpin is on
+    # Handle channel pins
     if update.message.sender_chat and update.message.sender_chat.type == constants.ChatType.CHANNEL:
         if SETTINGS["antichannelpin"] == "on":
             try:
@@ -94,10 +106,11 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
     user_id = update.message.from_user.id
     
-    if OWNER_ID is None:
-        OWNER_ID = user_id
+    if BOT_CONFIG["owner_id"] is None:
+        BOT_CONFIG["owner_id"] = user_id
 
-    if BOT_NAME.lower() in text:
+    # Check for Name Mention (Dynamic)
+    if BOT_CONFIG["name"].lower() in text:
         found_fact = False
         for fact in CUSTOM_FACTS:
             if fact in text:
@@ -105,12 +118,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 found_fact = True
                 break
         if not found_fact:
-            await update.message.reply_text("Yes? I'm listening! How can I help you today?")
+            await update.message.reply_text(f"Yes? I'm {BOT_CONFIG['name']}! How can I help you today?")
         return
 
-    if AWAY_MODE and user_id != OWNER_ID:
+    # Owner Away Mode
+    if BOT_CONFIG["away_mode"] and user_id != BOT_CONFIG["owner_id"]:
         if update.message.chat.type in [constants.ChatType.GROUP, constants.ChatType.SUPERGROUP]:
-            await update.message.reply_text("The Owner is currently busy and cannot reply. I am here to help you instead!")
+            await update.message.reply_text(f"The Owner is currently busy. I am {BOT_CONFIG['name']}, here to assist you!")
 
 # --- PIN COMMANDS ---
 
@@ -197,9 +211,8 @@ async def teach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Got it! I've memorized that {keyword} is {info}.")
 
 async def toggle_away(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AWAY_MODE
-    AWAY_MODE = not AWAY_MODE
-    status = "ON" if AWAY_MODE else "OFF"
+    BOT_CONFIG["away_mode"] = not BOT_CONFIG["away_mode"]
+    status = "ON" if BOT_CONFIG["away_mode"] else "OFF"
     await update.message.reply_text(f"Owner Away Mode is now {status}.")
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -233,13 +246,13 @@ async def run_bot():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("setname", set_name))
     application.add_handler(CommandHandler("away", toggle_away))
     application.add_handler(CommandHandler("teach", teach))
     application.add_handler(CommandHandler("id", get_id))
     application.add_handler(CommandHandler("ban", ban))
     application.add_handler(CommandHandler("kick", kick))
     
-    # Pin Handlers
     application.add_handler(CommandHandler("pinned", get_pinned))
     application.add_handler(CommandHandler("pin", pin_message))
     application.add_handler(CommandHandler("permapin", permapin))
