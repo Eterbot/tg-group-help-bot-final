@@ -12,6 +12,10 @@ BOT_NAME = "GP Help Bot"
 OWNER_ID = None  # Will be set dynamically or can be hardcoded
 AWAY_MODE = False
 CUSTOM_FACTS = {} # Simple in-memory memory for facts
+SETTINGS = {
+    "antichannelpin": "off",
+    "cleanlinked": "off"
+}
 
 # --- LOGGING ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -27,9 +31,12 @@ def home():
 def run_web():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
-def keep_alive():
-    t = Thread(target=run_web)
-    t.start()
+# --- HELPERS ---
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == constants.ChatType.PRIVATE:
+        return True
+    member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+    return member.status in [constants.ChatMemberStatus.ADMINISTRATOR, constants.ChatMemberStatus.OWNER]
 
 # --- BOT HANDLERS ---
 
@@ -41,35 +48,56 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Available Commands:</b>\n"
         "/start - Start the bot\n"
         "/help - Show this message\n"
-        "/ban - Ban a user (Admin only)\n"
-        "/kick - Kick a user (Admin only)\n"
-        "/mute - Mute a user (Admin only)\n"
-        "/unban - Unban a user (Admin only)\n"
-        "/unmute - Unmute a user (Admin only)\n"
-        "/away - Toggle Owner Away Mode (Owner only)\n"
+        "/ban - Ban a user (Reply)\n"
+        "/kick - Kick a user (Reply)\n"
+        "/mute - Mute a user (Reply)\n"
+        "/unban - Unban a user\n"
+        "/unmute - Unmute a user\n"
+        "/away - Toggle Owner Away Mode\n"
         "/teach [fact] [value] - Teach me something\n"
-        "/id - Get your ID and Group ID\n"
-        "\n<b>Interaction:</b>\n"
-        "Mention my name 'GP Help Bot' to ask me something!\n"
-        "If Owner is away, I will reply to messages for them."
+        "/id - Get IDs\n\n"
+        "<b>Pin Commands:</b>\n"
+        "/pinned - Get current pin\n"
+        "/pin - Pin a message (Reply)\n"
+        "/permapin [text] - Pin custom text\n"
+        "/unpin - Unpin message\n"
+        "/unpinall - Unpin all\n"
+        "/antichannelpin [on/off] - Toggle channel pin blocking\n"
+        "/cleanlinked [on/off] - Delete linked channel messages\n"
     )
     await update.message.reply_text(help_text, parse_mode=constants.ParseMode.HTML)
 
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AWAY_MODE, OWNER_ID
-    if not update.message or not update.message.text:
+    if not update.message:
+        return
+
+    # Handle linked channel messages if cleanlinked is on
+    if update.message.is_automatic_forward and SETTINGS["cleanlinked"] == "on":
+        try:
+            await update.message.delete()
+            return
+        except:
+            pass
+
+    # Handle channel pins if antichannelpin is on
+    if update.message.sender_chat and update.message.sender_chat.type == constants.ChatType.CHANNEL:
+        if SETTINGS["antichannelpin"] == "on":
+            try:
+                await context.bot.unpin_chat_message(update.effective_chat.id, update.message.message_id)
+            except:
+                pass
+
+    if not update.message.text:
         return
 
     text = update.message.text.lower()
     user_id = update.message.from_user.id
     
-    # Set owner ID on first interaction or hardcode it
     if OWNER_ID is None:
-        OWNER_ID = user_id # For simplicity, first person to talk to it is owner in this demo
+        OWNER_ID = user_id
 
-    # 1. Check for Name Mention
     if BOT_NAME.lower() in text:
-        # Check if it's a question about taught facts
         found_fact = False
         for fact in CUSTOM_FACTS:
             if fact in text:
@@ -80,11 +108,84 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Yes? I'm listening! How can I help you today?")
         return
 
-    # 2. Owner Away Mode
     if AWAY_MODE and user_id != OWNER_ID:
-        # Simple auto-reply if someone talks in the group and owner is away
         if update.message.chat.type in [constants.ChatType.GROUP, constants.ChatType.SUPERGROUP]:
             await update.message.reply_text("The Owner is currently busy and cannot reply. I am here to help you instead!")
+
+# --- PIN COMMANDS ---
+
+async def get_pinned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = await context.bot.get_chat(update.effective_chat.id)
+    if chat.pinned_message:
+        await update.message.reply_text("Current pinned message is here.", reply_to_message_id=chat.pinned_message.message_id)
+    else:
+        await update.message.reply_text("No message is currently pinned.")
+
+async def pin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a message to pin it.")
+        return
+    
+    notify = any(arg in context.args for arg in ["loud", "notify"])
+    try:
+        await context.bot.pin_chat_message(update.effective_chat.id, update.message.reply_to_message.message_id, disable_notification=not notify)
+        await update.message.reply_text("Message pinned successfully.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def permapin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text("Usage: /permapin [text]")
+        return
+    text = " ".join(context.args)
+    msg = await update.message.reply_text(text, parse_mode=constants.ParseMode.MARKDOWN)
+    try:
+        await context.bot.pin_chat_message(update.effective_chat.id, msg.message_id)
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def unpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    try:
+        if update.message.reply_to_message:
+            await context.bot.unpin_chat_message(update.effective_chat.id, update.message.reply_to_message.message_id)
+        else:
+            await context.bot.unpin_chat_message(update.effective_chat.id)
+        await update.message.reply_text("Message unpinned.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def unpinall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    try:
+        await context.bot.unpin_all_chat_messages(update.effective_chat.id)
+        await update.message.reply_text("All messages unpinned.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def set_antichannelpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text(f"Current setting: {SETTINGS['antichannelpin']}")
+        return
+    val = context.args[0].lower()
+    if val in ["yes", "on"]: SETTINGS["antichannelpin"] = "on"
+    elif val in ["no", "off"]: SETTINGS["antichannelpin"] = "off"
+    await update.message.reply_text(f"Anti-channel pin set to: {SETTINGS['antichannelpin']}")
+
+async def set_cleanlinked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text(f"Current setting: {SETTINGS['cleanlinked']}")
+        return
+    val = context.args[0].lower()
+    if val in ["yes", "on"]: SETTINGS["cleanlinked"] = "on"
+    elif val in ["no", "off"]: SETTINGS["cleanlinked"] = "off"
+    await update.message.reply_text(f"Clean linked channel set to: {SETTINGS['cleanlinked']}")
+
+# --- UTILS ---
 
 async def teach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
@@ -104,27 +205,23 @@ async def toggle_away(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your ID: {update.effective_user.id}\nChat ID: {update.effective_chat.id}")
 
-# --- ADMIN COMMANDS ---
-
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat.type in [constants.ChatType.GROUP, constants.ChatType.SUPERGROUP]:
-        return
-    # Simple check for admin rights would go here
+    if not await is_admin(update, context): return
     try:
         if update.message.reply_to_message:
-            user_to_ban = update.message.reply_to_message.from_user.id
-            await context.bot.ban_chat_member(update.effective_chat.id, user_to_ban)
+            await context.bot.ban_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id)
             await update.message.reply_text("User has been banned.")
         else:
-            await update.message.reply_text("Please reply to a user's message to ban them.")
+            await update.message.reply_text("Reply to a user to ban.")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
     try:
         if update.message.reply_to_message:
-            user_to_kick = update.message.reply_to_message.from_user.id
-            await context.bot.unban_chat_member(update.effective_chat.id, user_to_kick)
+            uid = update.message.reply_to_message.from_user.id
+            await context.bot.unban_chat_member(update.effective_chat.id, uid)
             await update.message.reply_text("User has been kicked.")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -142,19 +239,26 @@ async def run_bot():
     application.add_handler(CommandHandler("ban", ban))
     application.add_handler(CommandHandler("kick", kick))
     
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
+    # Pin Handlers
+    application.add_handler(CommandHandler("pinned", get_pinned))
+    application.add_handler(CommandHandler("pin", pin_message))
+    application.add_handler(CommandHandler("permapin", permapin))
+    application.add_handler(CommandHandler("unpin", unpin))
+    application.add_handler(CommandHandler("unpinall", unpinall))
+    application.add_handler(CommandHandler("antichannelpin", set_antichannelpin))
+    application.add_handler(CommandHandler("cleanlinked", set_cleanlinked))
+    
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
 
     print("Bot started...")
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
     
-    # Keep running until the event loop is closed
     while True:
         await asyncio.sleep(1)
 
 if __name__ == '__main__':
-    # Start the bot in a background thread
     def start_bot_thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -162,7 +266,6 @@ if __name__ == '__main__':
 
     Thread(target=start_bot_thread, daemon=True).start()
 
-    # Start the keep-alive pinger in another thread
     import subprocess
     def start_pinger():
         if os.environ.get("RENDER_EXTERNAL_URL"):
@@ -170,6 +273,5 @@ if __name__ == '__main__':
     
     Thread(target=start_pinger, daemon=True).start()
     
-    # Run Flask in the main thread
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
