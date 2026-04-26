@@ -43,7 +43,7 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_ai_response(prompt):
     try:
-        system_instruction = f"You are {BOT_CONFIG['name']}, a helpful Telegram group bot. Answer in Burmese. Keep responses very short, concise, and direct (လိုတိုရှင်း). Avoid long explanations. If someone asks who you are, say you are {BOT_CONFIG['name']}."
+        system_instruction = f"You are {BOT_CONFIG['name']}, a helpful Telegram group bot. Answer in Burmese. Keep responses very short, concise, and direct (လိုတိုရှင်း). Avoid long explanations. Be friendly but brief. If the user just says your name or greets you, give a short friendly reply in Burmese."
         payload = {
             "contents": [{
                 "parts": [{"text": f"{system_instruction}\n\nUser: {prompt}"}]
@@ -51,10 +51,14 @@ def get_ai_response(prompt):
         }
         response = requests.post(GEMINI_URL, json=payload, timeout=10)
         response_data = response.json()
-        return response_data['candidates'][0]['content']['parts'][0]['text']
+        if 'candidates' in response_data and response_data['candidates']:
+            return response_data['candidates'][0]['content']['parts'][0]['text']
+        else:
+            logger.error(f"Gemini API Error: {response_data}")
+            return "အခုလောလောဆယ် ကျွန်တော် အနည်းငယ် အဆင်မပြေဖြစ်နေလို့ပါ။"
     except Exception as e:
         logger.error(f"AI Error: {e}")
-        return "စိတ်မရှိပါနဲ့၊ အခုလောလောဆယ် ကျွန်တော် အနည်းငယ် အဆင်မပြေဖြစ်နေလို့ပါ။"
+        return "စိတ်မရှိပါနဲ့၊ နည်းပညာပိုင်းဆိုင်ရာ အခက်အခဲလေး ရှိနေလို့ပါ။"
 
 # --- BOT HANDLERS ---
 
@@ -117,7 +121,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"ကျွန်တော် မှတ်ထားတာကတော့: {CUSTOM_FACTS[fact]} ပါ။")
                 return
         
-        # Otherwise, use AI
+        # Use AI directly (Removed static greeting)
         async with update.message.chat.send_action(constants.ChatAction.TYPING):
             ai_reply = get_ai_response(update.message.text)
             await update.message.reply_text(ai_reply)
