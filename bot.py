@@ -1,283 +1,154 @@
-import os
 import logging
-import asyncio
+import os
+import threading
+import time
 import requests
 from flask import Flask
-from threading import Thread
-from telegram import Update, constants
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+
+# Configure logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 TOKEN = "7529003560:AAGIIp-RM4tPwbH8dxD5fc2cdz22pvuu-Cw"
 GEMINI_API_KEY = "AIzaSyBUdm4tAPbd_PmVh8jc8DqnoBKzfZC2Zcw"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
-BOT_CONFIG = {
-    "name": "GP Help Bot",
-    "owner_id": None,
-    "away_mode": False
-}
-CUSTOM_FACTS = {} 
-SETTINGS = {
-    "antichannelpin": "off",
-    "cleanlinked": "off"
-}
+# --- DATA STORAGE (In-memory for simplicity, resets on restart) ---
+group_data = {} # {chat_id: {"welcome": str, "name": str, "notes": {}, "filters": {}}}
 
-# --- LOGGING ---
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- WEB SERVER FOR RENDER ---
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is running 24/7 with AI!"
-
-# --- HELPERS ---
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == constants.ChatType.PRIVATE:
-        return True
-    member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    return member.status in [constants.ChatMemberStatus.ADMINISTRATOR, constants.ChatMemberStatus.OWNER]
-
-def get_ai_response(prompt):
-    try:
-        system_instruction = f"You are {BOT_CONFIG['name']}, a helpful Telegram group bot. Answer in Burmese. Keep responses very short, concise, and direct (လိုတိုရှင်း). Avoid long explanations. Be friendly but brief. If the user just says your name or greets you, give a short friendly reply in Burmese."
-        payload = {
-            "contents": [{
-                "parts": [{"text": f"{system_instruction}\n\nUser: {prompt}"}]
-            }]
+def get_chat_data(chat_id):
+    if chat_id not in group_data:
+        group_data[chat_id] = {
+            "welcome": "Welcome to the group!",
+            "name": "အီတာ", # Default name
+            "notes": {},
+            "filters": {},
+            "owner_away": False
         }
-        response = requests.post(GEMINI_URL, json=payload, timeout=10)
-        response_data = response.json()
-        if 'candidates' in response_data and response_data['candidates']:
-            return response_data['candidates'][0]['content']['parts'][0]['text']
-        else:
-            logger.error(f"Gemini API Error: {response_data}")
-            return "အခုလောလောဆယ် ကျွန်တော် အနည်းငယ် အဆင်မပြေဖြစ်နေလို့ပါ။"
+    return group_data[chat_id]
+
+# --- AI INTEGRATION ---
+def get_ai_response(text, chat_id):
+    chat_config = get_chat_data(chat_id)
+    bot_name = chat_config.get("name", "အီတာ")
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {'Content-Type': 'application/json'}
+    
+    # Prompt engineering for concise Burmese response
+    prompt = f"You are a helpful Telegram group bot named '{bot_name}'. Respond in Burmese. Keep it very short and concise (one or two sentences max). User said: {text}"
+    
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return data['candidates'][0]['content']['parts'][0]['text']
     except Exception as e:
         logger.error(f"AI Error: {e}")
-        return "စိတ်မရှိပါနဲ့၊ နည်းပညာပိုင်းဆိုင်ရာ အခက်အခဲလေး ရှိနေလို့ပါ။"
+        return None # Return None so we can handle it in the message handler
 
-# --- BOT HANDLERS ---
-
+# --- COMMAND HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Hello! I am {BOT_CONFIG['name']}, your AI-powered group bot. Use /help to see commands.")
+    await update.message.reply_text("မင်္ဂလာပါ! ကျွန်တော်က Group Help Bot ပါ။ /help ကိုနှိပ်ပြီး ဘာတွေလုပ်လို့ရလဲ ကြည့်နိုင်ပါတယ်။")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        f"<b>Current Bot Name:</b> {BOT_CONFIG['name']}\n\n"
-        "<b>General Commands:</b>\n"
-        "/start - Start the bot\n"
-        "/help - Show this message\n"
-        "/setname [name] - Change my name (Admin only)\n"
-        "/away - Toggle Owner Away Mode\n"
-        "/teach [fact] [value] - Teach me something\n"
-        "/id - Get IDs\n\n"
-        "<b>Admin Commands:</b>\n"
-        "/ban, /kick, /mute (Reply to user)\n\n"
-        "<b>Pin Commands:</b>\n"
-        "/pinned, /pin, /permapin, /unpin, /unpinall\n\n"
-        f"<i>Tip: Mention '{BOT_CONFIG['name']}' to talk to AI (Concise responses)!</i>"
+        "📌 **Pin Commands:**\n"
+        "/pin - Message ကို pin ရန်\n"
+        "/unpin - Pin ဖြုတ်ရန်\n"
+        "/permapin [text] - Bot နာမည်နဲ့ pin ရန်\n\n"
+        "⚙️ **Settings:**\n"
+        "/setname [name] - Bot နာမည်ပြောင်းရန်\n"
+        "/setwelcome [text] - Welcome message ပြောင်းရန်\n\n"
+        "🤖 **AI Interaction:**\n"
+        "Bot နာမည်ကိုခေါ်ပြီး မေးခွန်းမေးနိုင်ပါတယ်။"
     )
-    await update.message.reply_text(help_text, parse_mode=constants.ParseMode.HTML)
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
     if not context.args:
-        await update.message.reply_text("Usage: /setname [new_name]")
+        await update.message.reply_text("အသုံးပြုပုံ - /setname [နာမည်]")
         return
     new_name = " ".join(context.args)
-    BOT_CONFIG["name"] = new_name
-    await update.message.reply_text(f"နာမည်ကို '{new_name}' လို့ ပြောင်းလိုက်ပါပြီ။")
+    get_chat_data(update.effective_chat.id)["name"] = new_name
+    await update.message.reply_text(f"Bot နာမည်ကို '{new_name}' လို့ ပြောင်းလိုက်ပါပြီ။")
 
-async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
-
-    # Clean linked channel messages
-    if update.message.is_automatic_forward and SETTINGS["cleanlinked"] == "on":
-        try: await update.message.delete(); return
-        except: pass
-
-    # Anti channel pin
-    if update.message.sender_chat and update.message.sender_chat.type == constants.ChatType.CHANNEL:
-        if SETTINGS["antichannelpin"] == "on":
-            try: await context.bot.unpin_chat_message(update.effective_chat.id, update.message.message_id)
-            except: pass
-
-    if not update.message.text: return
-    text = update.message.text.lower()
-    user_id = update.message.from_user.id
-    
-    if BOT_CONFIG["owner_id"] is None:
-        BOT_CONFIG["owner_id"] = user_id
-
-    # AI Interaction (Triggered by Name)
-    if BOT_CONFIG["name"].lower() in text:
-        # Check taught facts first
-        for fact in CUSTOM_FACTS:
-            if fact in text:
-                await update.message.reply_text(f"ကျွန်တော် မှတ်ထားတာကတော့: {CUSTOM_FACTS[fact]} ပါ။")
-                return
-        
-        # Use AI directly (Removed static greeting)
-        async with update.message.chat.send_action(constants.ChatAction.TYPING):
-            ai_reply = get_ai_response(update.message.text)
-            await update.message.reply_text(ai_reply)
-        return
-
-    # Owner Away Mode
-    if BOT_CONFIG["away_mode"] and user_id != BOT_CONFIG["owner_id"]:
-        if update.message.chat.type in [constants.ChatType.GROUP, constants.ChatType.SUPERGROUP]:
-            await update.message.reply_text(f"Owner က အခုလောလောဆယ် မအားသေးလို့ပါ။ ကျွန်တော် {BOT_CONFIG['name']} ကပဲ ကူညီပေးပါရစေ။")
-
-# --- PIN COMMANDS ---
-
-async def get_pinned(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = await context.bot.get_chat(update.effective_chat.id)
-    if chat.pinned_message:
-        await update.message.reply_text("Pinned message ကို ဒီမှာ ကြည့်နိုင်ပါတယ်။", reply_to_message_id=chat.pinned_message.message_id)
-    else:
-        await update.message.reply_text("Pin ထားတဲ့ message မရှိသေးပါ။")
-
-async def pin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
+async def pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
-        await update.message.reply_text("Pin လုပ်ဖို့ message တစ်ခုကို reply ပြန်ပေးပါ။")
+        await update.message.reply_text("Pin ရန်အတွက် message တစ်ခုကို reply ပြန်ပေးပါ။")
         return
-    notify = any(arg in context.args for arg in ["loud", "notify"])
-    try:
-        await context.bot.pin_chat_message(update.effective_chat.id, update.message.reply_to_message.message_id, disable_notification=not notify)
-        await update.message.reply_text("Message ကို pin လုပ်ပြီးပါပြီ။")
-    except Exception as e: await update.message.reply_text(f"Error: {e}")
-
-async def permapin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if not context.args:
-        await update.message.reply_text("Usage: /permapin [text]")
-        return
-    text = " ".join(context.args)
-    msg = await update.message.reply_text(text, parse_mode=constants.ParseMode.MARKDOWN)
-    try: await context.bot.pin_chat_message(update.effective_chat.id, msg.message_id)
-    except Exception as e: await update.message.reply_text(f"Error: {e}")
+    await update.message.reply_to_message.pin()
+    await update.message.reply_text("Message ကို Pin လိုက်ပါပြီ။")
 
 async def unpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    try:
-        if update.message.reply_to_message:
-            await context.bot.unpin_chat_message(update.effective_chat.id, update.message.reply_to_message.message_id)
-        else: await context.bot.unpin_chat_message(update.effective_chat.id)
-        await update.message.reply_text("Unpin လုပ်ပြီးပါပြီ။")
-    except Exception as e: await update.message.reply_text(f"Error: {e}")
+    await context.bot.unpin_chat_message(chat_id=update.effective_chat.id)
+    await update.message.reply_text("Pinned message ကို ဖြုတ်လိုက်ပါပြီ။")
 
-async def unpinall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    try:
-        await context.bot.unpin_all_chat_messages(update.effective_chat.id)
-        await update.message.reply_text("Messages အားလုံးကို unpin လုပ်ပြီးပါပြီ။")
-    except Exception as e: await update.message.reply_text(f"Error: {e}")
-
-async def set_antichannelpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if not context.args:
-        await update.message.reply_text(f"Current setting: {SETTINGS['antichannelpin']}")
+# --- MESSAGE HANDLER ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
         return
-    val = context.args[0].lower()
-    SETTINGS["antichannelpin"] = "on" if val in ["yes", "on"] else "off"
-    await update.message.reply_text(f"Anti-channel pin: {SETTINGS['antichannelpin']}")
 
-async def set_cleanlinked(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if not context.args:
-        await update.message.reply_text(f"Current setting: {SETTINGS['cleanlinked']}")
-        return
-    val = context.args[0].lower()
-    SETTINGS["cleanlinked"] = "on" if val in ["yes", "on"] else "off"
-    await update.message.reply_text(f"Clean linked channel: {SETTINGS['cleanlinked']}")
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    chat_config = get_chat_data(chat_id)
+    bot_name = chat_config.get("name", "အီတာ")
 
-# --- UTILS ---
+    # Check if bot name is mentioned
+    if bot_name.lower() in text.lower():
+        # Get AI response
+        response = get_ai_response(text, chat_id)
+        if response:
+            await update.message.reply_text(response)
+        else:
+            # Fallback if AI fails
+            await update.message.reply_text(f"စိတ်မရှိပါနဲ့၊ အခုလောလောဆယ် ကျွန်တော် (AI) အလုပ်မလုပ်နိုင်သေးလို့ပါ။ ခဏနေမှ ပြန်မေးပေးပါခင်ဗျာ။")
 
-async def teach(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /teach [keyword] [information]")
-        return
-    keyword = context.args[0].lower()
-    info = " ".join(context.args[1:])
-    CUSTOM_FACTS[keyword] = info
-    await update.message.reply_text(f"မှတ်သားထားလိုက်ပါပြီ။ {keyword} ဆိုတာ {info} ပါ။")
+# --- WEB SERVER FOR KEEP-ALIVE ---
+app = Flask(__name__)
 
-async def toggle_away(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    BOT_CONFIG["away_mode"] = not BOT_CONFIG["away_mode"]
-    status = "ON" if BOT_CONFIG["away_mode"] else "OFF"
-    await update.message.reply_text(f"Owner Away Mode is now {status}.")
+@app.route('/')
+def home():
+    return "Bot is running!"
 
-async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"User ID: {update.effective_user.id}\nChat ID: {update.effective_chat.id}")
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
 
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    try:
-        if update.message.reply_to_message:
-            await context.bot.ban_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id)
-            await update.message.reply_text("User ကို ban လိုက်ပါပြီ။")
-        else: await update.message.reply_text("Ban လုပ်ဖို့ reply ပြန်ပေးပါ။")
-    except Exception as e: await update.message.reply_text(f"Error: {e}")
-
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    try:
-        if update.message.reply_to_message:
-            uid = update.message.reply_to_message.from_user.id
-            await context.bot.unban_chat_member(update.effective_chat.id, uid)
-            await update.message.reply_text("User ကို kick လိုက်ပါပြီ။")
-    except Exception as e: await update.message.reply_text(f"Error: {e}")
+def keep_alive():
+    while True:
+        if RENDER_URL:
+            try:
+                requests.get(RENDER_URL)
+                logger.info("Keep-alive ping successful")
+            except Exception as e:
+                logger.error(f"Keep-alive ping failed: {e}")
+        time.sleep(600) # 10 minutes
 
 # --- MAIN ---
+if __name__ == '__main__':
+    # Start Flask in a background thread
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    # Start Keep-alive in a background thread
+    threading.Thread(target=keep_alive, daemon=True).start()
 
-async def run_bot():
-    application = Application.builder().token(TOKEN).build()
-
+    # Start Telegram Bot
+    application = ApplicationBuilder().token(TOKEN).build()
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("setname", set_name))
-    application.add_handler(CommandHandler("away", toggle_away))
-    application.add_handler(CommandHandler("teach", teach))
-    application.add_handler(CommandHandler("id", get_id))
-    application.add_handler(CommandHandler("ban", ban))
-    application.add_handler(CommandHandler("kick", kick))
-    application.add_handler(CommandHandler("pinned", get_pinned))
-    application.add_handler(CommandHandler("pin", pin_message))
-    application.add_handler(CommandHandler("permapin", permapin))
+    application.add_handler(CommandHandler("pin", pin))
     application.add_handler(CommandHandler("unpin", unpin))
-    application.add_handler(CommandHandler("unpinall", unpinall))
-    application.add_handler(CommandHandler("antichannelpin", set_antichannelpin))
-    application.add_handler(CommandHandler("cleanlinked", set_cleanlinked))
     
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
-
-    print("Bot started with AI...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    while True:
-        await asyncio.sleep(1)
-
-if __name__ == '__main__':
-    def start_bot_thread():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_bot())
-
-    Thread(target=start_bot_thread, daemon=True).start()
-
-    import subprocess
-    def start_pinger():
-        if os.environ.get("RENDER_EXTERNAL_URL"):
-            subprocess.Popen(["python3", "keep_alive.py"])
-    
-    Thread(target=start_pinger, daemon=True).start()
-    
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    logger.info("Bot started...")
+    application.run_polling()
